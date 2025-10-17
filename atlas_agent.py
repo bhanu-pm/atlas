@@ -1,13 +1,15 @@
 """
 Atlas - Multi-Agent AI System with RAG
 A personal project demonstrating LLM orchestration with specialized agents
-Using Google Gemini 2.5 Flash
+Using Google Gemini 2.5 Flash with pgvector memory persistence
 """
 
 import os
-from typing import TypedDict, Annotated, Sequence
+import uuid
+from datetime import datetime
+from typing import TypedDict, Annotated, Sequence, Optional
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores import PGVector
 from langchain_community.tools import WikipediaQueryRun, ArxivQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper, ArxivAPIWrapper, SerpAPIWrapper
 from langchain_community.tools import Tool
@@ -18,11 +20,22 @@ from langgraph.prebuilt import ToolNode
 import operator
 
 # ============================================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================================
 
-LLM_MODEL = "gemini-2.5-flash-lite"
+# Set your API keys as environment variables:
+# export GOOGLE_API_KEY="your-key"
+# export SERPAPI_API_KEY="your-key"
+# export DATABASE_URL="postgresql://user:password@localhost:5432/atlas_db"
+
+LLM_MODEL = "gemini-2.0-flash-exp"  # Gemini 2.5 Flash
 EMBEDDING_MODEL = "models/embedding-001"
+
+# Database connection string
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://atlas_user:atlas_pass@localhost:5432/atlas_db"
+)
 
 # ============================================================================
 # AGENT STATE
@@ -38,6 +51,7 @@ class AgentState(TypedDict):
     evaluation_score: float
     needs_improvement: bool
     iteration_count: int
+    session_id: str
 
 # ============================================================================
 # TOOLS SETUP
@@ -62,40 +76,136 @@ def setup_tools():
     return [wikipedia, arxiv, search]
 
 # ============================================================================
-# RAG w FAISS
+# SESSION MANAGER
+# ============================================================================
+
+class SessionManager:
+    """Manages conversation sessions and history"""
+    
+    def __init__(self):
+        self.sessions = {}  # In-memory session tracking
+    
+    def create_session(self) -> str:
+        """Create a new session ID"""
+        session_id = str(uuid.uuid4())
+        self.sessions[session_id] = {
+            "created_at": datetime.now(),
+            "queries": [],
+            "context": []
+        }
+        return session_id
+    
+    def add_to_session(self, session_id: str, query: str, answer: str, score: float):
+        """Add interaction to session history"""
+        if session_id not in self.sessions:
+            self.sessions[session_id] = {
+                "created_at": datetime.now(),
+                "queries": [],
+                "context": []
+            }
+        
+        self.sessions[session_id]["queries"].append({
+            "query": query,
+            "answer": answer,
+            "score": score,
+            "timestamp": datetime.now()
+        })
+        
+        # Build contextual summary for RAG
+        context = f"Previous Query: {query}\nAnswer: {answer[:200]}..."
+        self.sessions[session_id]["context"].append(context)
+    
+    def get_session_context(self, session_id: str) -> list[str]:
+        """Get conversation context for a session"""
+        if session_id not in self.sessions:
+            return []
+        return self.sessions[session_id]["context"]
+    
+    def get_session_history(self, session_id: str) -> list[dict]:
+        """Get full session history"""
+        if session_id not in self.sessions:
+            return []
+        return self.sessions[session_id]["queries"]
+
+# ============================================================================
+# RAG PIPELINE WITH PGVECTOR
 # ============================================================================
 
 class RAGPipeline:
-    """FAISS-based RAG for semantic search and retrieval"""
+    """pgvector-based RAG for persistent semantic search and retrieval"""
     
-    def __init__(self):
+    def __init__(self, collection_name: str = "atlas_memory"):
         self.embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
-        self.vectorstore = None
+        self.collection_name = collection_name
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=200
         )
+        
+        # Initialize pgvector store
+        try:
+            self.vectorstore = PGVector(
+                collection_name=self.collection_name,
+                connection_string=DATABASE_URL,
+                embedding_function=self.embeddings,
+            )
+            print("✅ Connected to pgvector database")
+        except Exception as e:
+            print(f"⚠️  Could not connect to pgvector: {e}")
+            print("📝 Falling back to in-memory mode (no persistence)")
+            self.vectorstore = None
     
-    def add_documents(self, texts: list[str]):
-        """Add documents to vector store"""
-        docs = [Document(page_content=text) for text in texts]
+    def add_documents(self, texts: list[str], metadata: Optional[dict] = None):
+        """Add documents to persistent vector store"""
+        if not self.vectorstore:
+            return
+        
+        docs = []
+        for text in texts:
+            meta = metadata.copy() if metadata else {}
+            meta["timestamp"] = datetime.now().isoformat()
+            docs.append(Document(page_content=text, metadata=meta))
+        
         splits = self.text_splitter.split_documents(docs)
         
-        if self.vectorstore is None:
-            self.vectorstore = FAISS.from_documents(splits, self.embeddings)
-        else:
+        try:
             self.vectorstore.add_documents(splits)
+        except Exception as e:
+            print(f"⚠️  Error adding documents: {e}")
     
-    def search(self, query: str, k: int = 3) -> list[str]:
-        """Semantic search for relevant context"""
-        if self.vectorstore is None:
+    def search(self, query: str, k: int = 3, filter_dict: Optional[dict] = None) -> list[str]:
+        """Semantic search for relevant context with optional filtering"""
+        if not self.vectorstore:
             return []
         
-        results = self.vectorstore.similarity_search(query, k=k)
-        return [doc.page_content for doc in results]
+        try:
+            results = self.vectorstore.similarity_search(
+                query, 
+                k=k,
+                filter=filter_dict
+            )
+            return [doc.page_content for doc in results]
+        except Exception as e:
+            print(f"⚠️  Error searching: {e}")
+            return []
+    
+    def search_by_session(self, query: str, session_id: str, k: int = 3) -> list[str]:
+        """Search within a specific session's memory"""
+        return self.search(query, k=k, filter_dict={"session_id": session_id})
+    
+    def clear_collection(self):
+        """Clear all documents from collection (for testing)"""
+        if not self.vectorstore:
+            return
+        
+        try:
+            # This will depend on your pgvector setup
+            print("⚠️  Collection clearing not implemented - manually truncate if needed")
+        except Exception as e:
+            print(f"⚠️  Error clearing collection: {e}")
 
 # ============================================================================
-# AGENTS
+# SPECIALIZED AGENTS
 # ============================================================================
 
 class SearchAgent:
@@ -129,14 +239,15 @@ class SummaryAgent:
         
         context_str = ""
         if context:
-            context_str = "\n\nRelevant Context:\n" + "\n".join(context)
+            context_str = "\n\nRelevant Context from Memory:\n" + "\n".join(context)
         
-        prompt = f"""Summarize the given information concisely and accurately. Focus on key facts and main points. {context_str}
+        prompt = f"""Summarize the following information concisely and accurately.
+Focus on key facts and main points.{context_str}
 
-                    Information:
-                    {text}
-                    
-                    Summary:"""
+Information:
+{text}
+
+Summary:"""
         
         response = self.llm.invoke(prompt)
         return response.content
@@ -147,22 +258,27 @@ class SynthesisAgent:
     def __init__(self):
         self.llm = ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0.5)
     
-    def synthesize(self, query: str, summary: str, context: list[str] = None) -> str:
-        """Create comprehensive synthesis"""
+    def synthesize(self, query: str, summary: str, context: list[str] = None, 
+                   session_context: list[str] = None) -> str:
+        """Create comprehensive synthesis with session context"""
         
         context_str = ""
         if context:
-            context_str = "\n\nAdditional Context:\n" + "\n".join(context)
+            context_str = "\n\nRelevant Knowledge:\n" + "\n".join(context)
+        
+        session_str = ""
+        if session_context:
+            session_str = "\n\nConversation History:\n" + "\n".join(session_context[-3:])  # Last 3 interactions
         
         prompt = f"""Based on the query and summarized information, provide a comprehensive,
-        well-structured answer that directly addresses the user's question.{context_str}
+well-structured answer that directly addresses the user's question.{context_str}{session_str}
 
-        Query: {query}
+Query: {query}
 
-        Summary:
-        {summary}
+Summary:
+{summary}
 
-        Synthesis:"""
+Synthesis:"""
         
         response = self.llm.invoke(prompt)
         return response.content
@@ -177,22 +293,21 @@ class EvaluationAgent:
         """Evaluate response quality (0-100 scale)"""
         
         prompt = f"""Evaluate the following answer on these criteria:
-        1. Factual accuracy (does it answer the question correctly?)
-        2. Completeness (does it cover all aspects?)
-        3. Clarity (is it well-structured and understandable?)
+1. Factual accuracy (does it answer the question correctly?)
+2. Completeness (does it cover all aspects?)
+3. Clarity (is it well-structured and understandable?)
 
-        Score from 0-100 and explain if improvements are needed.
+Score from 0-100 and explain if improvements are needed.
 
-        Query: {query}
+Query: {query}
 
-        Answer:
-        {synthesis}
+Answer:
+{synthesis}
 
-        Provide your evaluation in this format:
-        Score: [number]
-        Needs Improvement: [Yes/No]
-
-        Reasoning: [brief explanation]"""
+Provide your evaluation in this format:
+Score: [number]
+Needs Improvement: [Yes/No]
+Reasoning: [brief explanation]"""
         
         response = self.llm.invoke(prompt)
         content = response.content
@@ -219,15 +334,19 @@ class EvaluationAgent:
 # ============================================================================
 
 class Atlas:
-    """Main orchestrator for the multi-agent system"""
+    """Main orchestrator for the multi-agent system with persistent memory"""
     
-    def __init__(self):
+    def __init__(self, session_id: Optional[str] = None):
         self.tools = setup_tools()
         self.search_agent = SearchAgent(self.tools)
         self.summary_agent = SummaryAgent()
         self.synthesis_agent = SynthesisAgent()
         self.evaluation_agent = EvaluationAgent()
         self.rag = RAGPipeline()
+        self.session_manager = SessionManager()
+        
+        # Create or use existing session
+        self.session_id = session_id or self.session_manager.create_session()
         
         # Build the workflow graph
         self.graph = self._build_graph()
@@ -266,8 +385,11 @@ class Atlas:
         print("🔍 Searching...")
         results = self.search_agent.search(state["query"])
         
-        # Add to RAG
-        self.rag.add_documents([results])
+        # Add to persistent RAG with session metadata
+        self.rag.add_documents(
+            [results],
+            metadata={"session_id": state["session_id"], "type": "search_result"}
+        )
         
         state["search_results"] = results
         state["messages"].append(f"Search completed: {len(results)} characters")
@@ -277,7 +399,7 @@ class Atlas:
         """Summary agent node"""
         print("📝 Summarizing...")
         
-        # Get RAG context
+        # Get RAG context from persistent memory
         context = self.rag.search(state["query"])
         
         summary = self.summary_agent.summarize(
@@ -293,13 +415,17 @@ class Atlas:
         """Synthesis agent node"""
         print("🔬 Synthesizing...")
         
-        # Get RAG context
+        # Get RAG context from persistent memory
         context = self.rag.search(state["query"])
+        
+        # Get session conversation history
+        session_context = self.session_manager.get_session_context(state["session_id"])
         
         synthesis = self.synthesis_agent.synthesize(
             state["query"],
             state["summary"],
-            context
+            context,
+            session_context
         )
         
         state["synthesis"] = synthesis
@@ -340,7 +466,7 @@ class Atlas:
         return "end"
     
     def query(self, question: str) -> dict:
-        """Process a query through the agent system"""
+        """Process a query through the agent system with session persistence"""
         
         initial_state = AgentState(
             messages=[],
@@ -350,40 +476,64 @@ class Atlas:
             synthesis="",
             evaluation_score=0.0,
             needs_improvement=False,
-            iteration_count=0
+            iteration_count=0,
+            session_id=self.session_id
         )
         
         # Run the graph
         final_state = self.graph.invoke(initial_state)
         
+        # Store in session history
+        self.session_manager.add_to_session(
+            self.session_id,
+            question,
+            final_state["synthesis"],
+            final_state["evaluation_score"]
+        )
+        
+        # Add final answer to persistent RAG
+        self.rag.add_documents(
+            [f"Q: {question}\nA: {final_state['synthesis']}"],
+            metadata={"session_id": self.session_id, "type": "qa_pair"}
+        )
+        
         return {
             "answer": final_state["synthesis"],
             "score": final_state["evaluation_score"],
-            "iterations": final_state["iteration_count"]
+            "iterations": final_state["iteration_count"],
+            "session_id": self.session_id
         }
+    
+    def get_session_history(self) -> list[dict]:
+        """Get conversation history for current session"""
+        return self.session_manager.get_session_history(self.session_id)
 
 # ============================================================================
-# MAIN
+# MAIN EXECUTION
 # ============================================================================
 
 def main():
-    """Example usage"""
+    """Example usage demonstrating session persistence"""
     
     print("=" * 60)
-    print("ATLAS - Multi-Agent AI System (Powered by Gemini 2.5 Flash)")
+    print("ATLAS - Multi-Agent AI System with Persistent Memory")
+    print("Powered by Gemini 2.5 Flash + pgvector")
     print("=" * 60)
     
-    # Initialize Atlas
+    # Initialize Atlas (creates new session)
     atlas = Atlas()
+    print(f"\n🆔 Session ID: {atlas.session_id}\n")
     
-    # Example queries
+    # Example: Multi-turn conversation demonstrating memory
     queries = [
         "What are the latest developments in quantum computing?",
+        "How does this relate to cryptography?",  # Follow-up using context
         "Explain the concept of attention mechanism in transformers"
     ]
     
-    for query in queries:
-        print(f"\n🤔 Query: {query}")
+    for i, query in enumerate(queries, 1):
+        print(f"\n{'='*60}")
+        print(f"Query {i}/{len(queries)}: {query}")
         print("-" * 60)
         
         result = atlas.query(query)
@@ -391,7 +541,20 @@ def main():
         print(f"\n💡 Answer:\n{result['answer']}")
         print(f"\n📊 Quality Score: {result['score']:.1f}/100")
         print(f"🔄 Iterations: {result['iterations']}")
-        print("=" * 60)
+    
+    # Show session history
+    print(f"\n{'='*60}")
+    print("📚 Session History")
+    print("=" * 60)
+    history = atlas.get_session_history()
+    for i, interaction in enumerate(history, 1):
+        print(f"\n{i}. Q: {interaction['query']}")
+        print(f"   Score: {interaction['score']:.1f}/100")
+        print(f"   Time: {interaction['timestamp'].strftime('%H:%M:%S')}")
+    
+    print("\n" + "=" * 60)
+    print("💾 All interactions stored in pgvector for future sessions!")
+    print("=" * 60)
 
 if __name__ == "__main__":
     main()

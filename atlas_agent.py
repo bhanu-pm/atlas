@@ -16,19 +16,15 @@ from langchain_community.tools import Tool
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
 import operator
+from dotenv import load_dotenv
+load_dotenv()
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-# Set your API keys as environment variables:
-# export GOOGLE_API_KEY="your-key"
-# export SERPAPI_API_KEY="your-key"
-# export DATABASE_URL="postgresql://user:password@localhost:5432/atlas_db"
-
-LLM_MODEL = "gemini-2.0-flash-exp"  # Gemini 2.5 Flash
+LLM_MODEL = "gemini-2.5-flash-lite"
 EMBEDDING_MODEL = "models/embedding-001"
 
 # Database connection string
@@ -186,7 +182,7 @@ class RAGPipeline:
             )
             return [doc.page_content for doc in results]
         except Exception as e:
-            print(f"⚠️  Error searching: {e}")
+            print(f"⚠ Error searching: {e}")
             return []
     
     def search_by_session(self, query: str, session_id: str, k: int = 3) -> list[str]:
@@ -353,27 +349,26 @@ class Atlas:
     
     def _build_graph(self):
         """Build LangGraph workflow"""
-        
         workflow = StateGraph(AgentState)
         
-        # Add nodes
-        workflow.add_node("search", self._search_node)
-        workflow.add_node("summary", self._summary_node)
-        workflow.add_node("synthesis", self._synthesis_node)
-        workflow.add_node("evaluation", self._evaluation_node)
+        # Add nodes with new names
+        workflow.add_node("search_node", self._search_node)
+        workflow.add_node("summarize_node", self._summary_node)
+        workflow.add_node("synthesize_node", self._synthesis_node)
+        workflow.add_node("evaluate_node", self._evaluation_node)
         
-        # Define edges
-        workflow.set_entry_point("search")
-        workflow.add_edge("search", "summary")
-        workflow.add_edge("summary", "synthesis")
-        workflow.add_edge("synthesis", "evaluation")
+        # Define edges using the new names
+        workflow.set_entry_point("search_node")
+        workflow.add_edge("search_node", "summarize_node")
+        workflow.add_edge("summarize_node", "synthesize_node")
+        workflow.add_edge("synthesize_node", "evaluate_node")
         
-        # Conditional edge: re-run if needs improvement
+        # Conditional edge using the new name
         workflow.add_conditional_edges(
-            "evaluation",
+            "evaluate_node",  # <-- Change this
             self._should_continue,
             {
-                "continue": "search",
+                "continue": "search_node", # <-- Change this
                 "end": END
             }
         )
